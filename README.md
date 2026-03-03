@@ -25,7 +25,7 @@ Clone into your ComfyUI custom nodes directory:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/capitan01R/comfyui-zimage-turbo-lora.git
+git clone https://github.com/capitan01R/Comfyui-ZiT-Lora-loader.git
 ```
 
 No additional dependencies required -- uses only ComfyUI builtins.
