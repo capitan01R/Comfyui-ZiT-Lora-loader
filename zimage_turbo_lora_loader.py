@@ -71,17 +71,35 @@ class ZImageTurboLoraLoader:
                 "Key mapping may not work correctly."
             )
 
-        # Build architecture-specific key map
-        key_map = self._build_key_map(model)
-
         # Convert separate Q/K/V -> fused QKV if the LoRA needs it
         if auto_convert_qkv and self._has_separate_qkv(lora_sd):
             logger.info("[Z-Image LoRA] Detected separate Q/K/V -- fusing to QKV format")
             lora_sd = self._convert_to_fused_qkv(lora_sd, model)
 
+        # Build key map AFTER conversion so fused keys are included
+        key_map = self._build_key_map(model, lora_sd)
+
         # Load and apply patches
         patch_dict = comfy.lora.load_lora(lora_sd, key_map, log_missing=False)
         logger.info(f"[Z-Image LoRA] Applied {len(patch_dict)} patches (strength={strength_model})")
+
+        # Log what we missed
+        loaded = set()
+        for x in key_map:
+            for suffix in (".lora_A.weight", ".lora_B.weight", ".alpha",
+                           ".lora_down.weight", ".lora_up.weight",
+                           ".diff", ".diff_b", ".w_norm", ".b_norm"):
+                if f"{x}{suffix}" in lora_sd:
+                    loaded.add(x)
+                    break
+
+        matched = set()
+        for x in key_map:
+            if key_map[x] in patch_dict or (isinstance(key_map[x], tuple) and key_map[x][0] in patch_dict):
+                matched.add(x)
+
+        logger.info(f"[Z-Image LoRA] Key map entries: {len(key_map)}, "
+                     f"LoRA keys found: {len(loaded)}, patches created: {len(patch_dict)}")
 
         model_lora = model.clone()
         model_lora.add_patches(patch_dict, strength_patch=strength_model, strength_model=1.0)
@@ -92,15 +110,31 @@ class ZImageTurboLoraLoader:
     # Key mapping
     # ------------------------------------------------------------------
 
-    def _build_key_map(self, model):
+    def _build_key_map(self, model, lora_sd=None):
         """
         Build Z-Image Turbo key mapping.
 
-        Tries ComfyUI's built-in z_image_to_diffusers() first (handles the full
-        Lumina2 architecture), falls back to manual state_dict iteration.
+        Combines z_image_to_diffusers() mappings with direct native key
+        identity mappings so that BOTH diffusers-format AND native-format
+        LoRA keys can be resolved.
         """
         key_map = {}
 
+        # Step 1: Always add native identity mappings from the model state dict.
+        # This ensures that LoRA keys already in native format (like after
+        # our QKV fusion) can find their target weights.
+        for model_key in model.model.state_dict().keys():
+            if model_key.startswith("diffusion_model.") and model_key.endswith(".weight"):
+                base = model_key[:-len(".weight")]
+                # Native key -> native weight
+                key_map[base] = model_key
+                # Also accept without prefix
+                if base.startswith("diffusion_model."):
+                    short = base[len("diffusion_model."):]
+                    key_map[short] = model_key
+
+        # Step 2: Add z_image_to_diffusers() mappings on top (diffusers -> native).
+        # These handle LoRAs that use diffusers-style key naming.
         if isinstance(model.model, comfy.model_base.Lumina2):
             try:
                 diffusers_keys = comfy.utils.z_image_to_diffusers(
@@ -113,27 +147,43 @@ class ZImageTurboLoraLoader:
                         continue
                     lora_key = k[:-len(".weight")]
 
-                    # Accept LoRA keys from all common naming conventions
                     key_map[f"diffusion_model.{lora_key}"] = target
                     key_map[f"transformer.{lora_key}"] = target
                     key_map[f"lycoris_{lora_key.replace('.', '_')}"] = target
                     key_map[lora_key] = target
 
-                logger.info(f"[Z-Image LoRA] Key map: {len(key_map)} entries (z_image_to_diffusers)")
-                return key_map
+                logger.info(f"[Z-Image LoRA] Key map: {len(key_map)} entries")
 
             except Exception as e:
-                logger.warning(f"[Z-Image LoRA] z_image_to_diffusers failed ({e}), using fallback")
+                logger.warning(f"[Z-Image LoRA] z_image_to_diffusers failed ({e})")
 
-        # Fallback: derive from model state dict
-        for model_key in model.model.state_dict().keys():
-            if model_key.startswith("diffusion_model.") and model_key.endswith(".weight"):
-                base = model_key[len("diffusion_model."):-len(".weight")]
-                key_map[base] = model_key
-                key_map[f"diffusion_model.{base}"] = model_key
-                key_map[f"transformer.{base}"] = model_key
+        # Step 3: If we have the actual LoRA state dict, add any prefixed
+        # variants we see in it to maximize matching.
+        if lora_sd is not None:
+            lora_prefixes = set()
+            for k in lora_sd:
+                # Strip suffixes like .lora_A.weight, .alpha, etc
+                for suffix in (".lora_A.weight", ".lora_B.weight", ".alpha",
+                               ".lora_down.weight", ".lora_up.weight",
+                               ".dora_scale", ".diff", ".diff_b"):
+                    if k.endswith(suffix):
+                        lora_prefixes.add(k[:-len(suffix)])
+                        break
 
-        logger.info(f"[Z-Image LoRA] Key map: {len(key_map)} entries (fallback)")
+            model_sd_keys = set(model.model.state_dict().keys())
+            for prefix in lora_prefixes:
+                if prefix in key_map:
+                    continue
+                # Try to find the matching model weight
+                candidates = [
+                    f"{prefix}.weight",
+                    f"diffusion_model.{prefix}.weight",
+                ]
+                for c in candidates:
+                    if c in model_sd_keys:
+                        key_map[prefix] = c
+                        break
+
         return key_map
 
     # ------------------------------------------------------------------
@@ -158,69 +208,102 @@ class ZImageTurboLoraLoader:
           lora_A: cat([q_down, k_down, v_down], dim=0)  ->  [rank*3, dim]
           lora_B: cat([q_up,   k_up,   v_up],   dim=0)  ->  [dim*3,  rank]
         """
-        n_layers = getattr(model.model.model_config.unet_config, "n_layers", 30)
-
         converted = {}
         processed = set()
 
-        for layer_idx in range(n_layers):
-            for prefix in ("diffusion_model.", "transformer.", ""):
-                base = f"{prefix}layers.{layer_idx}.attention"
+        # Collect all layer indices and prefixes that have Q/K/V
+        qkv_groups = {}  # (prefix, layer_idx) -> {component: (down, up)}
+        out_renames = {}  # old_base -> new_base
 
-                # --- Fuse Q/K/V -------------------------------------------
-                qkv_parts = {}
-                for component in ("to_q", "to_k", "to_v"):
+        for k in lora_sd:
+            for component in ("to_q", "to_k", "to_v"):
+                if f".{component}.lora_A" in k:
+                    # Extract the base path before .to_q etc
+                    idx = k.index(f".{component}.")
+                    base = k[:idx]
+                    if base not in qkv_groups:
+                        qkv_groups[base] = {}
+
                     down_key = f"{base}.{component}.lora_A.weight"
                     up_key = f"{base}.{component}.lora_B.weight"
+
                     if down_key in lora_sd and up_key in lora_sd:
-                        qkv_parts[component] = (lora_sd[down_key], lora_sd[up_key])
-
-                if len(qkv_parts) == 3:
-                    q_down, q_up = qkv_parts["to_q"]
-                    k_down, k_up = qkv_parts["to_k"]
-                    v_down, v_up = qkv_parts["to_v"]
-
-                    converted[f"{base}.qkv.lora_A.weight"] = torch.cat([q_down, k_down, v_down], dim=0)
-                    converted[f"{base}.qkv.lora_B.weight"] = torch.cat([q_up, k_up, v_up], dim=0)
-
-                    # Average alpha values
-                    alphas = []
-                    for component in ("to_q", "to_k", "to_v"):
-                        alpha_key = f"{base}.{component}.alpha"
-                        if alpha_key in lora_sd:
-                            alphas.append(lora_sd[alpha_key])
-                            processed.add(alpha_key)
-                    if len(alphas) == 3:
-                        converted[f"{base}.qkv.alpha"] = sum(alphas) / 3.0
-
-                    for component in ("to_q", "to_k", "to_v"):
-                        processed.add(f"{base}.{component}.lora_A.weight")
-                        processed.add(f"{base}.{component}.lora_B.weight")
-
-                    logger.debug(f"[Z-Image LoRA] Layer {layer_idx}: fused QKV")
-                    break  # done with this layer
-
-                # --- Rename to_out.0 -> out --------------------------------
-                out_down_key = f"{base}.to_out.0.lora_A.weight"
-                out_up_key = f"{base}.to_out.0.lora_B.weight"
-
-                if out_down_key in lora_sd and out_up_key in lora_sd:
-                    converted[f"{base}.out.lora_A.weight"] = lora_sd[out_down_key]
-                    converted[f"{base}.out.lora_B.weight"] = lora_sd[out_up_key]
-                    processed.update([out_down_key, out_up_key])
-
-                    out_alpha_key = f"{base}.to_out.0.alpha"
-                    if out_alpha_key in lora_sd:
-                        converted[f"{base}.out.alpha"] = lora_sd[out_alpha_key]
-                        processed.add(out_alpha_key)
-
-                    logger.debug(f"[Z-Image LoRA] Layer {layer_idx}: remapped out projection")
+                        qkv_groups[base][component] = (lora_sd[down_key], lora_sd[up_key])
                     break
+
+            # Track to_out.0 renames
+            if ".to_out.0.lora_A" in k:
+                idx = k.index(".to_out.0.")
+                base = k[:idx]
+                out_renames[base] = True
+
+        # Fuse Q/K/V groups
+        for base, parts in qkv_groups.items():
+            if len(parts) == 3 and "to_q" in parts and "to_k" in parts and "to_v" in parts:
+                q_down, q_up = parts["to_q"]
+                k_down, k_up = parts["to_k"]
+                v_down, v_up = parts["to_v"]
+
+                # Figure out the correct native key path
+                # LoRA might use: diffusion_model.layers.X.attention.to_q
+                # Native model uses: diffusion_model.layers.X.attention.qkv
+                native_base = base
+                # Strip any attention suffix variations
+                if native_base.endswith(".attention"):
+                    pass  # already correct
+                elif ".attention" in native_base:
+                    pass  # has attention in path
+
+                converted[f"{native_base}.qkv.lora_A.weight"] = torch.cat([q_down, k_down, v_down], dim=0)
+                converted[f"{native_base}.qkv.lora_B.weight"] = torch.cat([q_up, k_up, v_up], dim=0)
+
+                # Average alpha values
+                alphas = []
+                for component in ("to_q", "to_k", "to_v"):
+                    alpha_key = f"{base}.{component}.alpha"
+                    if alpha_key in lora_sd:
+                        alphas.append(lora_sd[alpha_key])
+                        processed.add(alpha_key)
+                if alphas:
+                    converted[f"{native_base}.qkv.alpha"] = sum(alphas) / len(alphas)
+
+                for component in ("to_q", "to_k", "to_v"):
+                    processed.add(f"{base}.{component}.lora_A.weight")
+                    processed.add(f"{base}.{component}.lora_B.weight")
+
+                logger.debug(f"[Z-Image LoRA] Fused QKV: {base} -> {native_base}.qkv")
+
+        # Rename to_out.0 -> out
+        for base in out_renames:
+            for suffix in (".lora_A.weight", ".lora_B.weight", ".alpha"):
+                old_key = f"{base}.to_out.0{suffix}"
+                new_key = f"{base}.out{suffix}"
+                if old_key in lora_sd and old_key not in processed:
+                    converted[new_key] = lora_sd[old_key]
+                    processed.add(old_key)
+                    logger.debug(f"[Z-Image LoRA] Remapped: {old_key} -> {new_key}")
 
         # Pass through everything else untouched
         for key, value in lora_sd.items():
             if key not in processed:
                 converted[key] = value
 
-        logger.info(f"[Z-Image LoRA] Converted {len(processed)} keys to Z-Image format")
+        logger.info(f"[Z-Image LoRA] Converted {len(processed)} keys, "
+                     f"output has {len(converted)} keys")
+
+        # Debug: log the fused keys we created
+        fused_keys = [k for k in converted if ".qkv.lora_" in k]
+        logger.info(f"[Z-Image LoRA] Fused QKV keys created: {len(fused_keys)}")
+        for k in sorted(fused_keys)[:5]:
+            logger.info(f"[Z-Image LoRA]   {k}  {list(converted[k].shape)}")
+
         return converted
+
+
+NODE_CLASS_MAPPINGS = {
+    "ZImageTurboLoraLoader": ZImageTurboLoraLoader,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ZImageTurboLoraLoader": "Z-Image Turbo LoRA Loader",
+}
