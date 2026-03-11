@@ -226,7 +226,6 @@ class ZImageTurboLoraLoader:
         return converted
 
 
-_LORA_OPTS = ["None"] + folder_paths.get_filename_list("loras")
 _MAX_SLOTS = 10
 
 
@@ -234,9 +233,10 @@ class ZImageTurboLoraStack(ZImageTurboLoraLoader):
 
     @classmethod
     def INPUT_TYPES(cls):
+        lora_opts = ["None"] + folder_paths.get_filename_list("loras")
         optional = {}
         for i in range(1, _MAX_SLOTS + 1):
-            optional[f"lora_{i}"]     = (_LORA_OPTS,)
+            optional[f"lora_{i}"]     = (lora_opts,)
             optional[f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01})
             optional[f"enabled_{i}"]  = ("BOOLEAN", {"default": True, "label_on": "On", "label_off": "Off"})
             optional[f"fuse_qkv_{i}"] = ("BOOLEAN", {"default": True, "label_on": "Fuse QKV", "label_off": "Direct"})
