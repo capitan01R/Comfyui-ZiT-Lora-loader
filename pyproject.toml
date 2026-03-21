@@ -1,7 +1,7 @@
 [project]
 name = "Comfyui-ZiT-Lora-loader"
 description = "Architecture-aware LoRA loader for Z-Image Turbo (Lumina2) in ComfyUI. Fixes silent key mismatches by auto-fusing separate Q/K/V into Z-Image's fused QKV format and remapping output projections."
-version = "1.2.1"
+version = "2.0.0"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
