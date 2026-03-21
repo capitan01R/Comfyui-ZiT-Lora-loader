@@ -1,4 +1,14 @@
-from .zimage_turbo_lora_loader import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .zimage_turbo_lora_loader import (
+    NODE_CLASS_MAPPINGS as _LOADER_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _LOADER_NAMES,
+)
+from .zimage_lora_auto_strength import (
+    NODE_CLASS_MAPPINGS as _AUTO_CLASSES,
+    NODE_DISPLAY_NAME_MAPPINGS as _AUTO_NAMES,
+)
+
+NODE_CLASS_MAPPINGS = {**_LOADER_CLASSES, **_AUTO_CLASSES}
+NODE_DISPLAY_NAME_MAPPINGS = {**_LOADER_NAMES, **_AUTO_NAMES}
 
 WEB_DIRECTORY = "./js"
 
